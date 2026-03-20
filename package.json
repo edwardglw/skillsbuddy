@@ -1,0 +1,9 @@
+{
+  "name": "cloud-ai-buddy-programme",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "check": "node --check src/app.js"
+  }
+}
