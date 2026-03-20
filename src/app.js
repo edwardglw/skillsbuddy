@@ -1,5 +1,7 @@
 const app = document.querySelector('#app');
-const STORAGE_KEY = 'cloud-ai-buddy-programme-state';
+const APP_CONFIG = window.APP_CONFIG || {};
+const SHARED_STATE_CONFIG = APP_CONFIG.sharedState || {};
+const LOCAL_STORAGE_KEY = 'cloud-ai-buddy-programme-state';
 const VIEWS = {
   pairings: 'pairings',
   waiting: 'waiting',
@@ -54,7 +56,25 @@ const DEFAULT_TOPICS_LIST = Object.entries(DEFAULT_TOPICS).flatMap(([category, n
   })),
 );
 
-function createDefaultState() {
+const state = {
+  data: createDefaultData(),
+  loaded: false,
+  loading: true,
+  view: VIEWS.pairings,
+  showFilters: false,
+  topicFilters: [],
+  levelFilters: [],
+  modal: null,
+  toast: null,
+  error: '',
+  syncMode: 'Private to this browser',
+  syncStatus: 'Loading…',
+  lastUpdatedAt: '',
+};
+
+const storageService = createStorageService(SHARED_STATE_CONFIG);
+
+function createDefaultData() {
   return {
     topics: DEFAULT_TOPICS_LIST,
     waitingEntries: [],
@@ -72,22 +92,160 @@ function createDefaultState() {
   };
 }
 
-const storage = {
-  get() {
-    if (window.storage?.get) {
-      return parseStoredValue(window.storage.get(STORAGE_KEY));
-    }
-    return parseStoredValue(window.localStorage.getItem(STORAGE_KEY));
-  },
-  set(value) {
-    const serialised = JSON.stringify(value);
-    if (window.storage?.set) {
-      window.storage.set(STORAGE_KEY, serialised);
-      return;
-    }
-    window.localStorage.setItem(STORAGE_KEY, serialised);
-  },
-};
+function createStorageService(sharedConfig) {
+  const localStorageService = {
+    label: 'Private to this browser',
+    shared: false,
+    async get() {
+      return readLocalEnvelope();
+    },
+    async set(envelope) {
+      writeLocalEnvelope(envelope);
+      return envelope;
+    },
+    startPolling() {
+      return () => {};
+    },
+  };
+
+  if (!isSharedStateConfigured(sharedConfig)) {
+    return localStorageService;
+  }
+
+  return {
+    label: 'Shared across everyone using this site',
+    shared: true,
+    async get() {
+      try {
+        const remoteEnvelope = await readSharedEnvelope(sharedConfig);
+        if (remoteEnvelope) {
+          writeLocalEnvelope(remoteEnvelope);
+          return remoteEnvelope;
+        }
+      } catch (error) {
+        console.error('Shared state load failed:', error);
+      }
+
+      return readLocalEnvelope();
+    },
+    async set(envelope) {
+      writeLocalEnvelope(envelope);
+      await writeSharedEnvelope(sharedConfig, envelope);
+      return envelope;
+    },
+    startPolling(onRemoteEnvelope) {
+      const pollInterval = sharedConfig.pollIntervalMs || 15000;
+      const intervalId = window.setInterval(async () => {
+        try {
+          const remoteEnvelope = await readSharedEnvelope(sharedConfig);
+          if (!remoteEnvelope) return;
+          if (remoteEnvelope.updatedAt > state.lastUpdatedAt) {
+            writeLocalEnvelope(remoteEnvelope);
+            onRemoteEnvelope(remoteEnvelope);
+          }
+        } catch (error) {
+          console.error('Shared state polling failed:', error);
+        }
+      }, pollInterval);
+
+      return () => window.clearInterval(intervalId);
+    },
+  };
+}
+
+function isSharedStateConfigured(sharedConfig) {
+  return Boolean(
+    sharedConfig?.enabled &&
+      sharedConfig?.provider === 'supabase' &&
+      sharedConfig?.supabaseUrl &&
+      sharedConfig?.supabaseAnonKey &&
+      sharedConfig?.table &&
+      sharedConfig?.rowId,
+  );
+}
+
+function readLocalEnvelope() {
+  const rawValue = window.localStorage.getItem(LOCAL_STORAGE_KEY);
+  if (!rawValue) return null;
+
+  const parsed = parseStoredValue(rawValue);
+  return normaliseEnvelope(parsed);
+}
+
+function writeLocalEnvelope(envelope) {
+  window.localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(envelope));
+}
+
+async function readSharedEnvelope(sharedConfig) {
+  const response = await fetch(
+    `${sharedConfig.supabaseUrl}/rest/v1/${sharedConfig.table}?id=eq.${encodeURIComponent(
+      sharedConfig.rowId,
+    )}&select=id,payload,updated_at`,
+    {
+      headers: createSupabaseHeaders(sharedConfig),
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(`Shared load failed with status ${response.status}`);
+  }
+
+  const rows = await response.json();
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+
+  return normaliseEnvelope({
+    updatedAt: rows[0].updated_at,
+    data: rows[0].payload,
+  });
+}
+
+async function writeSharedEnvelope(sharedConfig, envelope) {
+  const response = await fetch(
+    `${sharedConfig.supabaseUrl}/rest/v1/${sharedConfig.table}?on_conflict=id`,
+    {
+      method: 'POST',
+      headers: {
+        ...createSupabaseHeaders(sharedConfig),
+        'Content-Type': 'application/json',
+        Prefer: 'resolution=merge-duplicates,return=representation',
+      },
+      body: JSON.stringify([
+        {
+          id: sharedConfig.rowId,
+          payload: envelope.data,
+          updated_at: envelope.updatedAt,
+        },
+      ]),
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(`Shared save failed with status ${response.status}`);
+  }
+}
+
+function createSupabaseHeaders(sharedConfig) {
+  return {
+    apikey: sharedConfig.supabaseAnonKey,
+    Authorization: `Bearer ${sharedConfig.supabaseAnonKey}`,
+    Accept: 'application/json',
+  };
+}
+
+function normaliseEnvelope(candidate) {
+  if (!candidate) return null;
+  if (candidate.data && candidate.updatedAt) {
+    return {
+      updatedAt: candidate.updatedAt,
+      data: sanitiseState(candidate.data),
+    };
+  }
+
+  return {
+    updatedAt: new Date().toISOString(),
+    data: sanitiseState(candidate),
+  };
+}
 
 function parseStoredValue(value) {
   if (!value) return null;
@@ -111,20 +269,6 @@ function slugify(value) {
     .replace(/(^-|-$)/g, '');
 }
 
-function getTopicById(topicId) {
-  return state.data.topics.find((topic) => topic.id === topicId);
-}
-
-function getGroupType(members) {
-  return new Set(members.map((member) => member.level)).size === 1 ? 'Peer' : 'Mentor / Mentee';
-}
-
-function getPairingDescription(existingLevel, joiningLevel) {
-  if (existingLevel === joiningLevel) return 'Peer-to-peer';
-  if (LEVELS.indexOf(joiningLevel) > LEVELS.indexOf(existingLevel)) return 'Mentor-to-mentee';
-  return 'Mentee-to-mentor';
-}
-
 function sanitiseState(input) {
   const topics = sanitiseTopics(input?.topics);
   const waitingEntries = Array.isArray(input?.waitingEntries)
@@ -132,7 +276,7 @@ function sanitiseState(input) {
     : [];
   const groups = Array.isArray(input?.groups)
     ? input.groups.map((group) => sanitiseGroup(group, topics)).filter(Boolean)
-    : createDefaultState().groups;
+    : createDefaultData().groups;
 
   return { topics, waitingEntries, groups };
 }
@@ -174,6 +318,7 @@ function sanitiseEntry(entry, topics) {
 
 function sanitiseGroup(group, topics) {
   if (!topics.some((topic) => topic.id === group?.topicId)) return null;
+
   const members = Array.isArray(group?.members)
     ? group.members
         .map((member) => {
@@ -199,182 +344,18 @@ function byTopicName(left, right) {
   return left.name.localeCompare(right.name);
 }
 
-const state = {
-  data: sanitiseState(storage.get() || createDefaultState()),
-  view: VIEWS.pairings,
-  showFilters: false,
-  topicFilters: [],
-  levelFilters: [],
-  modal: null,
-  toast: null,
-  error: '',
-};
-
-function persistAndRender(message) {
-  storage.set(state.data);
-  if (message) showToast(message);
-  render();
+function getTopicById(topicId) {
+  return state.data.topics.find((topic) => topic.id === topicId);
 }
 
-function showToast(message) {
-  state.toast = message;
-  window.clearTimeout(showToast.timeoutId);
-  showToast.timeoutId = window.setTimeout(() => {
-    state.toast = null;
-    render();
-  }, 2500);
+function getGroupType(members) {
+  return new Set(members.map((member) => member.level)).size === 1 ? 'Peer' : 'Mentor / Mentee';
 }
 
-function getAllNames() {
-  const waiting = state.data.waitingEntries.map((entry) => entry.name.toLowerCase());
-  const grouped = state.data.groups.flatMap((group) => group.members.map((member) => member.name.toLowerCase()));
-  return new Set([...waiting, ...grouped]);
-}
-
-function addWaitingEntry(payload) {
-  const name = payload.name.trim();
-  if (!name || !payload.topicId || !payload.level) {
-    state.error = 'Please complete every field before submitting.';
-    render();
-    return;
-  }
-
-  if (getAllNames().has(name.toLowerCase())) {
-    state.error = 'That name already exists in the programme.';
-    render();
-    return;
-  }
-
-  state.data.waitingEntries.push({
-    id: createId(),
-    name,
-    topicId: payload.topicId,
-    level: payload.level,
-    createdAt: new Date().toISOString(),
-  });
-  state.modal = null;
-  state.error = '';
-  persistAndRender(`${name} added to the waiting list.`);
-}
-
-function addTopic(payload) {
-  const name = payload.name.trim();
-  if (!name) {
-    state.error = 'Topic names cannot be blank.';
-    render();
-    return;
-  }
-
-  if (state.data.topics.some((topic) => topic.name.toLowerCase() === name.toLowerCase())) {
-    state.error = 'That topic already exists.';
-    render();
-    return;
-  }
-
-  state.data.topics.push({
-    id: createId(),
-    name,
-    category: payload.category,
-    isDefault: false,
-  });
-  state.data.topics.sort(byTopicName);
-  state.error = '';
-  persistAndRender(`${name} added to ${payload.category} topics.`);
-}
-
-function joinGroup(payload) {
-  const name = payload.name.trim();
-  if (!name) {
-    state.error = 'Please add a name before joining.';
-    render();
-    return;
-  }
-
-  if (getAllNames().has(name.toLowerCase())) {
-    state.error = 'That name already exists in the programme.';
-    render();
-    return;
-  }
-
-  const group = state.data.groups.find((item) => item.id === payload.groupId);
-  if (!group) return;
-
-  group.members.push({ id: createId(), name, level: payload.level });
-  state.modal = null;
-  state.error = '';
-  persistAndRender(`${name} joined the group.`);
-}
-
-function createPair(payload) {
-  const partnerName = payload.partnerName.trim();
-  if (!partnerName) {
-    state.error = 'Please add your name before creating a pairing.';
-    render();
-    return;
-  }
-
-  if (getAllNames().has(partnerName.toLowerCase())) {
-    state.error = 'That name already exists in the programme.';
-    render();
-    return;
-  }
-
-  const entryIndex = state.data.waitingEntries.findIndex((entry) => entry.id === payload.entryId);
-  if (entryIndex === -1) return;
-
-  const entry = state.data.waitingEntries[entryIndex];
-  state.data.waitingEntries.splice(entryIndex, 1);
-  state.data.groups.push({
-    id: createId(),
-    topicId: entry.topicId,
-    createdAt: new Date().toISOString(),
-    members: [
-      { id: createId(), name: entry.name, level: entry.level },
-      { id: createId(), name: partnerName, level: payload.partnerLevel },
-    ],
-  });
-  state.modal = null;
-  state.error = '';
-  persistAndRender(`New pairing created for ${entry.name}.`);
-}
-
-function removeMember(groupId, memberId) {
-  const groupIndex = state.data.groups.findIndex((group) => group.id === groupId);
-  if (groupIndex === -1) return;
-
-  const group = state.data.groups[groupIndex];
-  const remainingMembers = group.members.filter((member) => member.id !== memberId);
-
-  if (remainingMembers.length >= 2) {
-    group.members = remainingMembers;
-  } else {
-    state.data.groups.splice(groupIndex, 1);
-    if (remainingMembers.length === 1) {
-      state.data.waitingEntries.push({
-        id: createId(),
-        name: remainingMembers[0].name,
-        level: remainingMembers[0].level,
-        topicId: group.topicId,
-        createdAt: new Date().toISOString(),
-      });
-    }
-  }
-
-  state.error = '';
-  persistAndRender('Member removed and group cleanup completed.');
-}
-
-function resetProgramme() {
-  state.data = sanitiseState(createDefaultState());
-  state.topicFilters = [];
-  state.levelFilters = [];
-  state.modal = null;
-  state.error = '';
-  persistAndRender('Programme reset to default state.');
-}
-
-function toggleFilter(list, value) {
-  return list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
+function getPairingDescription(existingLevel, joiningLevel) {
+  if (existingLevel === joiningLevel) return 'Peer to peer';
+  if (LEVELS.indexOf(joiningLevel) > LEVELS.indexOf(existingLevel)) return 'Mentor to mentee';
+  return 'Mentee to mentor';
 }
 
 function groupedWaiting() {
@@ -413,6 +394,186 @@ function topicActivity(topicId) {
   };
 }
 
+function getAllNames() {
+  const waiting = state.data.waitingEntries.map((entry) => entry.name.toLowerCase());
+  const grouped = state.data.groups.flatMap((group) => group.members.map((member) => member.name.toLowerCase()));
+  return new Set([...waiting, ...grouped]);
+}
+
+async function persistState(message) {
+  const envelope = {
+    updatedAt: new Date().toISOString(),
+    data: state.data,
+  };
+
+  state.syncStatus = storageService.shared ? 'Syncing changes…' : 'Saved in this browser';
+  render();
+
+  try {
+    const storedEnvelope = await storageService.set(envelope);
+    state.lastUpdatedAt = storedEnvelope.updatedAt;
+    state.syncStatus = storageService.shared ? `Live for everyone · ${formatDateTime(storedEnvelope.updatedAt)}` : 'Saved in this browser';
+    if (message) showToast(message);
+  } catch (error) {
+    console.error('Persist failed:', error);
+    state.error = 'We could not save your changes. Please try again.';
+    state.syncStatus = storageService.shared ? 'Shared sync failed' : 'Save failed';
+  }
+
+  render();
+}
+
+function showToast(message) {
+  state.toast = message;
+  window.clearTimeout(showToast.timeoutId);
+  showToast.timeoutId = window.setTimeout(() => {
+    state.toast = null;
+    render();
+  }, 2600);
+}
+
+async function addWaitingEntry(payload) {
+  const name = payload.name.trim();
+  if (!name || !payload.topicId || !payload.level) {
+    state.error = 'Please complete every field.';
+    render();
+    return;
+  }
+
+  if (getAllNames().has(name.toLowerCase())) {
+    state.error = 'That name already exists in the programme.';
+    render();
+    return;
+  }
+
+  state.data.waitingEntries.push({
+    id: createId(),
+    name,
+    topicId: payload.topicId,
+    level: payload.level,
+    createdAt: new Date().toISOString(),
+  });
+  state.modal = null;
+  state.error = '';
+  await persistState(`${name} added to the waiting list.`);
+}
+
+async function addTopic(payload) {
+  const name = payload.name.trim();
+  if (!name) {
+    state.error = 'Topic names cannot be blank.';
+    render();
+    return;
+  }
+
+  if (state.data.topics.some((topic) => topic.name.toLowerCase() === name.toLowerCase())) {
+    state.error = 'That topic already exists.';
+    render();
+    return;
+  }
+
+  state.data.topics.push({
+    id: createId(),
+    name,
+    category: payload.category,
+    isDefault: false,
+  });
+  state.data.topics.sort(byTopicName);
+  state.error = '';
+  await persistState(`${name} added to ${payload.category}.`);
+}
+
+async function joinGroup(payload) {
+  const name = payload.name.trim();
+  if (!name) {
+    state.error = 'Please add a name before joining.';
+    render();
+    return;
+  }
+
+  if (getAllNames().has(name.toLowerCase())) {
+    state.error = 'That name already exists in the programme.';
+    render();
+    return;
+  }
+
+  const group = state.data.groups.find((item) => item.id === payload.groupId);
+  if (!group) return;
+
+  group.members.push({ id: createId(), name, level: payload.level });
+  state.modal = null;
+  state.error = '';
+  await persistState(`${name} joined the group.`);
+}
+
+async function createPair(payload) {
+  const partnerName = payload.partnerName.trim();
+  if (!partnerName) {
+    state.error = 'Please add your name before creating a pairing.';
+    render();
+    return;
+  }
+
+  if (getAllNames().has(partnerName.toLowerCase())) {
+    state.error = 'That name already exists in the programme.';
+    render();
+    return;
+  }
+
+  const entryIndex = state.data.waitingEntries.findIndex((entry) => entry.id === payload.entryId);
+  if (entryIndex === -1) return;
+
+  const entry = state.data.waitingEntries[entryIndex];
+  state.data.waitingEntries.splice(entryIndex, 1);
+  state.data.groups.push({
+    id: createId(),
+    topicId: entry.topicId,
+    createdAt: new Date().toISOString(),
+    members: [
+      { id: createId(), name: entry.name, level: entry.level },
+      { id: createId(), name: partnerName, level: payload.partnerLevel },
+    ],
+  });
+  state.modal = null;
+  state.error = '';
+  await persistState(`Created a new pairing for ${entry.name}.`);
+}
+
+async function removeMember(groupId, memberId) {
+  const groupIndex = state.data.groups.findIndex((group) => group.id === groupId);
+  if (groupIndex === -1) return;
+
+  const group = state.data.groups[groupIndex];
+  const remainingMembers = group.members.filter((member) => member.id !== memberId);
+
+  if (remainingMembers.length >= 2) {
+    group.members = remainingMembers;
+  } else {
+    state.data.groups.splice(groupIndex, 1);
+    if (remainingMembers.length === 1) {
+      state.data.waitingEntries.push({
+        id: createId(),
+        name: remainingMembers[0].name,
+        level: remainingMembers[0].level,
+        topicId: group.topicId,
+        createdAt: new Date().toISOString(),
+      });
+    }
+  }
+
+  state.error = '';
+  await persistState('Member removed and the group was tidied up.');
+}
+
+async function resetProgramme() {
+  state.data = sanitiseState(createDefaultData());
+  state.topicFilters = [];
+  state.levelFilters = [];
+  state.modal = null;
+  state.error = '';
+  await persistState('Programme reset to default state.');
+}
+
 function render() {
   const topicCounts = TOPIC_CATEGORIES.reduce((counts, category) => {
     counts[category] = state.data.topics.filter((topic) => topic.category === category).length;
@@ -420,33 +581,49 @@ function render() {
   }, {});
   const waitingByTopic = groupedWaiting();
   const groupsByTopic = groupedGroups();
-  const waitingCount = Object.values(waitingByTopic).reduce((sum, entries) => sum + entries.length, 0);
-  const groupCount = Object.values(groupsByTopic).reduce((sum, groups) => sum + groups.length, 0);
-  const resultCount = state.view === VIEWS.waiting ? waitingCount : groupCount;
+  const filteredWaitingCount = Object.values(waitingByTopic).reduce((sum, entries) => sum + entries.length, 0);
+  const filteredGroupCount = Object.values(groupsByTopic).reduce((sum, groups) => sum + groups.length, 0);
+  const activeUsersCount = state.data.groups.reduce((sum, group) => sum + group.members.length, 0);
+  const resultCount = state.view === VIEWS.waiting ? filteredWaitingCount : filteredGroupCount;
 
   app.innerHTML = `
     <div class="app-shell">
       ${state.toast ? `<div class="toast-stack" aria-live="polite"><div class="toast">${escapeHtml(state.toast)}</div></div>` : ''}
-      <header class="hero-card">
-        <div>
-          <p class="eyebrow">Internal community tool</p>
-          <h1>Cloud &amp; AI Buddy Programme</h1>
-          <p class="hero-copy">Help colleagues discover, form, and manage buddy, peer-learning, mentor, and mentee connections around Cloud and AI topics.</p>
-          <div class="hero-actions">
-            <button class="primary-button" data-action="open-add">Add Myself</button>
-            <button class="secondary-button" data-action="reset">Reset to default</button>
+      <header class="top-shell">
+        <div class="brand-block">
+          <p class="eyebrow">Cloud & AI community programme</p>
+          <div class="brand-row">
+            <div>
+              <h1>Cloud &amp; AI Buddy Programme</h1>
+              <p class="hero-copy">Compact matching for buddying, mentoring, and peer learning across Cloud and AI topics.</p>
+            </div>
+            <div class="header-actions">
+              <button class="primary-button" data-action="open-add">Add Myself</button>
+              <button class="ghost-button" data-action="reset">Reset</button>
+            </div>
           </div>
         </div>
-        <div class="stats-grid">
-          <div class="stat-card emphasis">
-            <span class="stat-label">People waiting</span>
-            <strong>${state.data.waitingEntries.length}</strong>
+        <div class="sync-strip ${storageService.shared ? 'shared' : ''}">
+          <div>
+            <span class="sync-label">State</span>
+            <strong>${escapeHtml(state.syncMode)}</strong>
           </div>
+          <span class="sync-status">${escapeHtml(state.syncStatus)}</span>
+        </div>
+        <div class="metrics-row">
+          <article class="metric-card accent">
+            <span>Waiting</span>
+            <strong>${state.data.waitingEntries.length}</strong>
+          </article>
+          <article class="metric-card">
+            <span>Active people</span>
+            <strong>${activeUsersCount}</strong>
+          </article>
           ${TOPIC_CATEGORIES.filter((category) => topicCounts[category] > 0)
             .map(
               (category) => `
-                <button class="stat-card stat-button" data-action="open-topic-panel" data-category="${category}">
-                  <span class="stat-label">${category} topics</span>
+                <button class="metric-card metric-button" data-action="open-topic-panel" data-category="${category}">
+                  <span>${category}</span>
                   <strong>${topicCounts[category]}</strong>
                 </button>`,
             )
@@ -454,24 +631,26 @@ function render() {
         </div>
       </header>
 
-      <nav class="tabs" aria-label="Primary views">
-        <button class="tab ${state.view === VIEWS.pairings ? 'active' : ''}" data-action="switch-view" data-view="pairings">Active Pairings</button>
-        <button class="tab ${state.view === VIEWS.waiting ? 'active' : ''}" data-action="switch-view" data-view="waiting">Looking for a Buddy</button>
-      </nav>
-
-      <section class="filter-bar">
-        <div class="filter-summary">
-          <button class="secondary-button" data-action="toggle-filters">${state.showFilters ? 'Hide filters' : 'Show filters'}</button>
-          <span>${state.topicFilters.length + state.levelFilters.length} selected</span>
-          <button class="ghost-button" ${state.topicFilters.length + state.levelFilters.length === 0 ? 'disabled' : ''} data-action="clear-filters">Clear all</button>
+      <section class="toolbar-card">
+        <div class="toolbar-row compact-tabs" role="tablist" aria-label="Views">
+          <button class="tab ${state.view === VIEWS.pairings ? 'active' : ''}" data-action="switch-view" data-view="pairings">Active Pairings</button>
+          <button class="tab ${state.view === VIEWS.waiting ? 'active' : ''}" data-action="switch-view" data-view="waiting">Looking for a Buddy</button>
         </div>
-        <p class="filter-results">Showing ${resultCount} result(s).</p>
+        <div class="toolbar-row filters-summary">
+          <button class="filter-toggle" data-action="toggle-filters">${state.showFilters ? 'Hide filters' : 'Show filters'}</button>
+          <span>${state.topicFilters.length + state.levelFilters.length} selected</span>
+          <span>${resultCount} result(s)</span>
+          <button class="ghost-button small" ${state.topicFilters.length + state.levelFilters.length === 0 ? 'disabled' : ''} data-action="clear-filters">Clear all</button>
+        </div>
       </section>
 
       ${state.showFilters ? renderFilters() : ''}
       ${state.error ? `<div class="inline-alert">${escapeHtml(state.error)}</div>` : ''}
-      <main class="content-grid">${state.view === VIEWS.waiting ? renderWaiting(waitingByTopic) : renderGroups(groupsByTopic)}</main>
-      ${renderModal(waitingByTopic, groupsByTopic)}
+      ${state.loading ? '<section class="empty-state"><h2>Loading programme data…</h2></section>' : ''}
+      <main class="content-grid ${state.loading ? 'hidden' : ''}">
+        ${state.view === VIEWS.waiting ? renderWaiting(waitingByTopic) : renderGroups(groupsByTopic)}
+      </main>
+      ${renderModal()}
     </div>
   `;
 
@@ -480,9 +659,9 @@ function render() {
 
 function renderFilters() {
   return `
-    <section class="filters-panel">
+    <section class="filters-panel compact-panel">
       <div>
-        <h2>Topics</h2>
+        <p class="section-label">Topics</p>
         <div class="chip-wrap">
           ${state.data.topics
             .map(
@@ -495,7 +674,7 @@ function renderFilters() {
         </div>
       </div>
       <div>
-        <h2>Experience levels</h2>
+        <p class="section-label">Experience levels</p>
         <div class="chip-wrap">
           ${LEVELS.map(
             (level) => `
@@ -514,24 +693,26 @@ function renderWaiting(waitingByTopic) {
     .map(([topicId, entries]) => {
       const topic = getTopicById(topicId);
       return `
-        <section class="topic-card">
+        <section class="topic-card compact-card">
           <div class="topic-card-header">
             <div>
               <h2>${escapeHtml(topic.name)}</h2>
-              <span class="category-badge">${topic.category}</span>
+              <div class="meta-row">
+                <span class="category-badge">${topic.category}</span>
+                <span class="count-pill">${entries.length} waiting</span>
+              </div>
             </div>
-            <span class="count-pill">${entries.length} waiting</span>
           </div>
           <div class="stack-list">
             ${entries
               .map(
                 (entry) => `
-                  <article class="row-card">
-                    <div>
-                      <h3>${escapeHtml(entry.name)}</h3>
+                  <article class="row-card compact-row">
+                    <div class="person-block">
+                      <strong>${escapeHtml(entry.name)}</strong>
                       <span class="level-badge ${entry.level.toLowerCase()}">${entry.level}</span>
                     </div>
-                    <button class="primary-button" data-action="open-pair" data-entry-id="${entry.id}">Pair directly</button>
+                    <button class="secondary-button small" data-action="open-pair" data-entry-id="${entry.id}">Pair</button>
                   </article>`,
               )
               .join('')}
@@ -540,7 +721,7 @@ function renderWaiting(waitingByTopic) {
     })
     .join('');
 
-  return sections || `<section class="empty-state"><h2>No waiting users</h2><p>Add the first person to the waiting list to get the programme moving.</p></section>`;
+  return sections || `<section class="empty-state"><h2>No waiting users</h2><p>Add the first person to start the programme.</p></section>`;
 }
 
 function renderGroups(groupsByTopic) {
@@ -548,33 +729,35 @@ function renderGroups(groupsByTopic) {
     .map(([topicId, groups]) => {
       const topic = getTopicById(topicId);
       return `
-        <section class="topic-card">
+        <section class="topic-card compact-card">
           <div class="topic-card-header">
             <div>
               <h2>${escapeHtml(topic.name)}</h2>
-              <span class="category-badge">${topic.category}</span>
+              <div class="meta-row">
+                <span class="category-badge">${topic.category}</span>
+                <span class="count-pill">${groups.length} active</span>
+              </div>
             </div>
-            <span class="count-pill">${groups.length} active group(s)</span>
           </div>
           <div class="stack-list">
             ${groups
               .map(
                 (group) => `
-                  <article class="group-card">
+                  <article class="group-card compact-group">
                     <div class="group-card-header">
                       <span class="group-type">${getGroupType(group.members)}</span>
-                      <button class="secondary-button" data-action="open-join" data-group-id="${group.id}">Join group</button>
+                      <button class="secondary-button small" data-action="open-join" data-group-id="${group.id}">Join group</button>
                     </div>
-                    <div class="member-grid">
+                    <div class="member-grid compact-member-grid">
                       ${group.members
                         .map(
                           (member) => `
-                            <div class="member-card">
-                              <div>
-                                <h3>${escapeHtml(member.name)}</h3>
+                            <div class="member-card compact-member-card">
+                              <div class="person-block">
+                                <strong>${escapeHtml(member.name)}</strong>
                                 <span class="level-badge ${member.level.toLowerCase()}">${member.level}</span>
                               </div>
-                              <button class="ghost-button danger" data-action="remove-member" data-group-id="${group.id}" data-member-id="${member.id}">Remove</button>
+                              <button class="ghost-button small danger" data-action="remove-member" data-group-id="${group.id}" data-member-id="${member.id}">Remove</button>
                             </div>`,
                         )
                         .join('')}
@@ -587,28 +770,24 @@ function renderGroups(groupsByTopic) {
     })
     .join('');
 
-  return sections || `<section class="empty-state"><h2>No active groups</h2><p>Active pairings will appear here once people start connecting.</p></section>`;
+  return sections || `<section class="empty-state"><h2>No active groups</h2><p>Pairings will appear here once people start connecting.</p></section>`;
 }
 
-function renderModal(waitingByTopic, groupsByTopic) {
+function renderModal() {
   if (!state.modal) return '';
 
   if (state.modal.type === 'add-self') {
     return `
       <div class="modal-backdrop" data-action="close-modal">
-        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+        <div class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
           <div class="modal-header">
             <h2 id="modal-title">Add yourself</h2>
-            <button class="ghost-button" data-action="close-modal" aria-label="Close modal">✕</button>
+            <button class="ghost-button small" data-action="close-modal" aria-label="Close modal">✕</button>
           </div>
           <form class="modal-form" data-form="add-self">
             <label>Name<input name="name" placeholder="Your name" required /></label>
-            <label>Topic
-              <select name="topicId">${renderTopicOptions()}</select>
-            </label>
-            <label>Experience level
-              <select name="level">${LEVELS.map((level) => `<option value="${level}">${level}</option>`).join('')}</select>
-            </label>
+            <label>Topic<select name="topicId">${renderTopicOptions()}</select></label>
+            <label>Experience level<select name="level">${LEVELS.map((level) => `<option value="${level}">${level}</option>`).join('')}</select></label>
             <button class="primary-button" type="submit">Add to waiting list</button>
           </form>
         </div>
@@ -622,17 +801,15 @@ function renderModal(waitingByTopic, groupsByTopic) {
 
     return `
       <div class="modal-backdrop" data-action="close-modal">
-        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+        <div class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
           <div class="modal-header">
-            <h2 id="modal-title">Join an existing group</h2>
-            <button class="ghost-button" data-action="close-modal" aria-label="Close modal">✕</button>
+            <h2 id="modal-title">Join group</h2>
+            <button class="ghost-button small" data-action="close-modal" aria-label="Close modal">✕</button>
           </div>
           <p class="modal-copy">Join <strong>${escapeHtml(topic.name)}</strong> with ${group.members.length} existing member(s).</p>
           <form class="modal-form" data-form="join-group" data-group-id="${group.id}">
             <label>Name<input name="name" placeholder="Your name" required /></label>
-            <label>Experience level
-              <select name="level">${LEVELS.map((level) => `<option value="${level}">${level}</option>`).join('')}</select>
-            </label>
+            <label>Experience level<select name="level">${LEVELS.map((level) => `<option value="${level}">${level}</option>`).join('')}</select></label>
             <button class="primary-button" type="submit">Join group</button>
           </form>
         </div>
@@ -647,17 +824,15 @@ function renderModal(waitingByTopic, groupsByTopic) {
 
     return `
       <div class="modal-backdrop" data-action="close-modal">
-        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+        <div class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
           <div class="modal-header">
-            <h2 id="modal-title">Pair with someone waiting</h2>
-            <button class="ghost-button" data-action="close-modal" aria-label="Close modal">✕</button>
+            <h2 id="modal-title">Create pairing</h2>
+            <button class="ghost-button small" data-action="close-modal" aria-label="Close modal">✕</button>
           </div>
-          <p class="modal-copy">Create a <strong>${description.toLowerCase()}</strong> connection in <strong>${escapeHtml(topic.name)}</strong> with <strong>${escapeHtml(entry.name)}</strong>.</p>
+          <p class="modal-copy">${escapeHtml(entry.name)} is waiting in <strong>${escapeHtml(topic.name)}</strong>.</p>
           <form class="modal-form" data-form="pair" data-entry-id="${entry.id}">
             <label>Your name<input name="partnerName" placeholder="Your name" required /></label>
-            <label>Your experience level
-              <select name="partnerLevel">${LEVELS.map((level) => `<option value="${level}" ${level === (state.modal.partnerLevel || LEVELS[0]) ? 'selected' : ''}>${level}</option>`).join('')}</select>
-            </label>
+            <label>Your experience level<select name="partnerLevel">${LEVELS.map((level) => `<option value="${level}" ${level === (state.modal.partnerLevel || LEVELS[0]) ? 'selected' : ''}>${level}</option>`).join('')}</select></label>
             <p class="pairing-note">Match type: ${description}</p>
             <button class="primary-button" type="submit">Create pairing</button>
           </form>
@@ -669,21 +844,21 @@ function renderModal(waitingByTopic, groupsByTopic) {
     const topics = state.data.topics.filter((topic) => topic.category === state.modal.category);
     return `
       <div class="modal-backdrop" data-action="close-modal">
-        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+        <div class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
           <div class="modal-header">
-            <h2 id="modal-title">${state.modal.category} topic catalogue</h2>
-            <button class="ghost-button" data-action="close-modal" aria-label="Close modal">✕</button>
+            <h2 id="modal-title">${state.modal.category} topics</h2>
+            <button class="ghost-button small" data-action="close-modal" aria-label="Close modal">✕</button>
           </div>
-          <div class="topic-panel-list">
+          <div class="topic-panel-list compact-topic-list">
             ${topics
               .map((topic) => {
                 const activity = topicActivity(topic.id);
                 const active = activity.waiting > 0 || activity.groups > 0;
                 return `
-                  <div class="topic-panel-row">
+                  <div class="topic-panel-row compact-topic-row">
                     <div>
                       <strong>${escapeHtml(topic.name)}</strong>
-                      <p>${activity.waiting} waiting · ${activity.groups} group(s)</p>
+                      <p>${activity.waiting} waiting · ${activity.groups} groups</p>
                     </div>
                     <span class="status-pill ${active ? 'active' : ''}">${active ? 'Active' : 'Idle'}</span>
                   </div>`;
@@ -852,11 +1027,40 @@ function handleFormSubmit(event) {
   }
 }
 
+function toggleFilter(list, value) {
+  return list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
+}
+
+function formatDateTime(value) {
+  if (!value) return 'Not yet saved';
+  return new Date(value).toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
 window.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && state.modal) {
     state.modal = null;
     state.error = '';
     render();
+  }
+});
+
+window.addEventListener('focus', async () => {
+  if (!storageService.shared) return;
+  try {
+    const remoteEnvelope = await storageService.get();
+    if (remoteEnvelope && remoteEnvelope.updatedAt > state.lastUpdatedAt) {
+      state.data = remoteEnvelope.data;
+      state.lastUpdatedAt = remoteEnvelope.updatedAt;
+      state.syncStatus = `Live for everyone · ${formatDateTime(remoteEnvelope.updatedAt)}`;
+      render();
+    }
+  } catch (error) {
+    console.error('Focus refresh failed:', error);
   }
 });
 
@@ -869,4 +1073,43 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
-render();
+async function initialise() {
+  render();
+  state.syncMode = storageService.label;
+  state.syncStatus = storageService.shared ? 'Connecting shared state…' : 'Private to this browser';
+  render();
+
+  try {
+    const envelope = (await storageService.get()) || {
+      updatedAt: new Date().toISOString(),
+      data: createDefaultData(),
+    };
+
+    state.data = sanitiseState(envelope.data);
+    state.lastUpdatedAt = envelope.updatedAt;
+    state.loaded = true;
+    state.loading = false;
+    state.syncStatus = storageService.shared
+      ? `Live for everyone · ${formatDateTime(envelope.updatedAt)}`
+      : 'Private to this browser';
+    render();
+
+    if (storageService.shared) {
+      storageService.startPolling((remoteEnvelope) => {
+        state.data = remoteEnvelope.data;
+        state.lastUpdatedAt = remoteEnvelope.updatedAt;
+        state.syncStatus = `Live for everyone · ${formatDateTime(remoteEnvelope.updatedAt)}`;
+        showToast('Shared programme updated.');
+        render();
+      });
+    }
+  } catch (error) {
+    console.error('Initial load failed:', error);
+    state.loading = false;
+    state.syncStatus = 'Could not load saved data';
+    state.error = 'We could not load saved data. Showing the default programme instead.';
+    render();
+  }
+}
+
+initialise();
